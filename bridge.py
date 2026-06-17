@@ -227,13 +227,8 @@ def handle(sender, text, target_author, target_ts):
     is_owner = (sender == OWNER)
     with user_lock(sender):
         st = load_state()
-        # access control — notify the owner only ONCE per unknown sender
+        # access control — owner + allowlisted users only; everyone else ignored
         if not is_owner and sender not in st["allow"]:
-            notified = st.setdefault("notified", [])
-            if sender not in notified:
-                notified.append(sender)
-                save_state(st)
-                send(OWNER, f"📩 {sender} wants in — said: {text[:80]!r}\n/allow {sender} to grant.")
             return
         s = session(st, sender)
         body = text.strip()
@@ -311,14 +306,10 @@ def handle(sender, text, target_author, target_ts):
                     if not num.startswith("+"):
                         reply("Usage: /allow +<number> [label]"); return
                     st["allow"][num] = sp[1] if len(sp) > 1 else ""
-                    if num in st.get("notified", []):
-                        st["notified"].remove(num)
                     save_state(st); reply(f"✓ {num} {st['allow'][num]} can now text the bot."); return
                 if cmd == "/revoke":
                     if arg in st["allow"]:
                         lbl = st["allow"].pop(arg); st["sessions"].pop(arg, None)
-                        if arg in st.get("notified", []):
-                            st["notified"].remove(arg)   # let a future request notify again
                         save_state(st); reply(f"✓ {arg} {lbl} removed."); return
                     reply(f"{arg} not in allowlist."); return
             reply(f"Unknown command {cmd}. /help for the menu."); return
