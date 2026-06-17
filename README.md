@@ -39,7 +39,8 @@ Then text **`/help`** to that number's **Note to Self**.
   saved to disk until `/reset`; the model isn't pinned in VRAM between turns.
 - **Every generation parameter** tunable via `/set` (temperature, top_p, num_ctx,
   seed, mirostat, …), plus a `/raw` mode and a configurable default system prompt.
-- **👀 / ✅ reactions** mark received vs. done — useful for slow large models.
+- **Streams paragraph-by-paragraph** — replies arrive as each paragraph finishes,
+  not as one wall of text at the end; 👀 / ✅ reactions mark received vs. done.
 - **Owner-managed allowlist** — only you can `/allow` others; strangers are
   ignored and you get a heads-up.
 - Runs as a **systemd user service** (auto-restart, starts on boot).

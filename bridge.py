@@ -144,14 +144,26 @@ def list_models():
 def model_exists(name):
     return resolve_model(name) is not None
 
-def chat(model, messages, options):
+def chat_stream(model, messages, options):
+    """Yield content deltas from Ollama's /api/chat as they stream in."""
     body = json.dumps({"model": model, "messages": messages,
-                       "stream": False, "options": options}).encode()
+                       "stream": True, "options": options}).encode()
     req = urllib.request.Request(OLLAMA_URL + "/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=1800) as r:
-        data = json.load(r)
-    return data.get("message", {}).get("content", "").strip()
+        for line in r:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            delta = obj.get("message", {}).get("content", "")
+            if delta:
+                yield delta
+            if obj.get("done"):
+                break
 
 
 # ----- help text -----------------------------------------------------------
@@ -314,27 +326,38 @@ def handle(sender, text, target_author, target_ts):
                 send(ACCOUNT if sender == OWNER else sender, f"🤖 {full} — open. /help for commands.")
             return
 
-        # generate
-        react(ACCOUNT if sender == OWNER else sender, target_author, target_ts, "👀")
+        # generate — stream and flush paragraph-by-paragraph (on blank lines)
+        target = ACCOUNT if sender == OWNER else sender
+        react(target, target_author, target_ts, "👀")
+        if s["raw"]:
+            messages = [{"role": "user", "content": body}]
+        else:
+            messages = [{"role": "system", "content": s["system"] or DEFAULT_SYSTEM}]
+            messages += s["history"]
+            messages.append({"role": "user", "content": body})
+        full, buf, sent_any = "", "", False
         try:
-            if s["raw"]:
-                messages = [{"role": "user", "content": body}]
-            else:
-                messages = []
-                messages.append({"role": "system", "content": s["system"] or DEFAULT_SYSTEM})
-                messages += s["history"]
-                messages.append({"role": "user", "content": body})
-            answer = chat(s["model"], messages, s["options"])
-            if not s["raw"]:
-                s["history"].append({"role": "user", "content": body})
-                s["history"].append({"role": "assistant", "content": answer})
-                save_state(st)
+            for delta in chat_stream(s["model"], messages, s["options"]):
+                full += delta
+                buf += delta
+                while "\n\n" in buf:                 # flush each complete paragraph
+                    para, buf = buf.split("\n\n", 1)
+                    para = para.strip()
+                    if para:
+                        send(target, para); sent_any = True
         except Exception as e:
-            react(ACCOUNT if sender == OWNER else sender, target_author, target_ts, "❌")
-            send(ACCOUNT if sender == OWNER else sender, f"⚠️ error: {e}")
+            react(target, target_author, target_ts, "❌")
+            send(target, f"⚠️ error: {e}")
             return
-        react(ACCOUNT if sender == OWNER else sender, target_author, target_ts, "✅")
-        send(ACCOUNT if sender == OWNER else sender, answer or "(empty response)")
+        if buf.strip():                              # final partial paragraph
+            send(target, buf.strip()); sent_any = True
+        if not sent_any:
+            send(target, "(empty response)")
+        if not s["raw"]:
+            s["history"].append({"role": "user", "content": body})
+            s["history"].append({"role": "assistant", "content": full.strip()})
+            save_state(st)
+        react(target, target_author, target_ts, "✅")
 
 
 # ----- SSE listener --------------------------------------------------------
