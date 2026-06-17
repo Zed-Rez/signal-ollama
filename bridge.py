@@ -25,6 +25,7 @@ MODEL_DESC = {
     "llama3.3-abliterated-127k": "uncensored 70B, 127k ctx",
     "gpt-oss-64k":               "120B MoE, 64k ctx",
     "gpt-oss:120b":              "120B MoE",
+    "mistral-large-32k":         "123B dense, 32k ctx (biggest that fits)",
     "deepseek-r1:70b":           "reasoning, 70B",
     "qwen3-coder:30b":           "coder, 30B",
     "devstral:24b":              "coder, 24B",
@@ -39,6 +40,7 @@ ALIASES = {
     "L70U":  "llama2-uncensored:70b",       # Llama 70B Uncensored
     "GO120": "gpt-oss-64k",                  # GPT-OSS 120B (64k ctx build)
     "GO120B":"gpt-oss:120b",                 # GPT-OSS 120B (raw)
+    "ML123": "mistral-large-32k",            # Mistral-Large 123B (dense, 32k ctx)
     "DS70R": "deepseek-r1:70b",              # DeepSeek 70B Reasoning
     "Q30C":  "qwen3-coder:30b",              # Qwen 30B Coder
     "Q3C":   "qwen2.5-coder:3b",             # Qwen 3B Coder
