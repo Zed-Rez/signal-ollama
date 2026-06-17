@@ -10,7 +10,7 @@ Stdlib only (urllib + json). Persists per-user sessions to state.json so the
 selected model, system prompt, params and conversation history survive
 restarts; the Ollama model itself is NOT pinned in VRAM between turns.
 """
-import json, os, threading, time, urllib.request, urllib.error
+import base64, json, os, threading, time, urllib.request, urllib.error
 
 # --- config (all via env; see README) -------------------------------------
 SIGNAL_URL = os.environ.get("SIGNAL_URL", "http://127.0.0.1:8080")
@@ -19,6 +19,9 @@ ACCOUNT    = os.environ.get("SIGNAL_ACCOUNT", "").strip()        # the linked nu
 OWNER      = os.environ.get("SIGNAL_OWNER", ACCOUNT).strip()      # allowlist admin (defaults to ACCOUNT)
 STATE_FILE = os.path.expanduser(os.environ.get("SIGNAL_OLLAMA_STATE", "~/signal-ollama/state.json"))
 DEFAULT_SYSTEM = os.environ.get("SIGNAL_OLLAMA_SYSTEM", "You are a helpful, concise assistant.")
+# where signal-cli writes received attachments (host side of the daemon's config volume)
+ATTACH_DIR = os.path.expanduser(os.environ.get("SIGNAL_ATTACHMENTS_DIR",
+                                               "~/.local/share/signal-cli/attachments"))
 
 # Known-model one-line descriptions (anything else shows with no blurb).
 MODEL_DESC = {
@@ -34,8 +37,10 @@ MODEL_DESC = {
     "dolphin-llama3:70b":        "uncensored, 8k ctx",
 }
 
-# Short aliases (case-insensitive): initials + param count + role letter.
-ALIASES = {
+# Curated short aliases (case-insensitive). Any model WITHOUT one gets an alias
+# auto-generated at runtime: first >=3 letters of its name + parameter count in
+# billions (e.g. mistral-small:24b -> MIS24). Curated entries always win.
+CURATED = {
     "L70A":  "llama3.3-abliterated-127k",   # Llama 70B Abliterated (uncensored)
     "L70U":  "llama2-uncensored:70b",       # Llama 70B Uncensored
     "GO120": "gpt-oss-64k",                  # GPT-OSS 120B (64k ctx build)
@@ -47,16 +52,50 @@ ALIASES = {
     "DV24":  "devstral:24b",                 # Devstral 24B
     "DLP70": "dolphin-llama3:70b",           # Dolphin Llama 70B
 }
-_REV_ALIAS = {v: k for k, v in ALIASES.items()}
+
+def _norm(name):
+    return name[:-7] if name.endswith(":latest") else name
+
+def _auto_alias(name, pbil, taken):
+    """First >=3 letters of the model name + parameter-count-in-billions,
+    lengthened until unique (e.g. MIS24)."""
+    base = "".join(c for c in _norm(name).split(":")[0] if c.isalpha()).upper() or "MODEL"
+    for n in range(3, len(base) + 1):
+        cand = base[:n] + pbil
+        if cand not in taken:
+            return cand
+    cand, k = base + pbil, 2
+    while cand in taken:
+        cand, k = f"{base}{pbil}_{k}", k + 1
+    return cand
+
+def build_aliases():
+    """Return (alias_upper -> full model, normalized_full -> alias). Curated
+    aliases win; every other installed model gets an auto alias."""
+    a2f, f2a, taken = {}, {}, set()
+    for short, full in CURATED.items():
+        a2f[short.upper()] = full
+        f2a[_norm(full)] = short
+        taken.add(short.upper())
+    for m in sorted(_tags(), key=lambda x: x.get("name", "")):
+        full = m.get("name", "")
+        if not full or _norm(full) in f2a:
+            continue
+        cand = _auto_alias(full, _param_billions(m), taken)
+        a2f[cand] = full
+        f2a[_norm(full)] = cand
+        taken.add(cand)
+    return a2f, f2a
 
 def resolve_model(name):
     """Map an alias / full name / base name / unique substring to an installed
-    model. Fully general — works for any model in Ollama, not just aliased ones."""
+    model. Works for any model in Ollama (curated or auto-aliased)."""
     if not name:
         return None
     q = name.strip()
-    if q.upper() in ALIASES:                       # curated short alias
-        q = ALIASES[q.upper()]
+    a2f, _ = build_aliases()
+    if q.upper() in a2f:                           # alias (curated or auto)
+        q = a2f[q.upper()]
     names = list_models()
     ql = q.lower()
     for n in names:                                # exact, :latest, or base-name match
@@ -155,17 +194,52 @@ def canonical(idstr):
 
 
 # ----- ollama --------------------------------------------------------------
-def list_models():
+def _tags():
     try:
         with urllib.request.urlopen(OLLAMA_URL + "/api/tags", timeout=15) as r:
-            data = json.load(r)
-        return sorted(m["name"] for m in data.get("models", []))
+            return json.load(r).get("models", [])
     except Exception as e:
         print("ollama tags error", e, flush=True)
         return []
 
+def list_models():
+    return sorted(m["name"] for m in _tags())
+
+def _param_billions(m):
+    """Whole-billions parameter count from Ollama metadata, e.g. '70.6B' -> '70'."""
+    ps = (m.get("details") or {}).get("parameter_size") or ""
+    num = ""
+    for ch in ps:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        elif num:
+            break
+    try:
+        return str(int(float(num))) if num else ""   # truncate: 70.6B -> "70"
+    except ValueError:
+        return ""
+
 def model_exists(name):
     return resolve_model(name) is not None
+
+def model_is_vision(model):
+    """True if Ollama reports the model can take images (capabilities: vision)."""
+    try:
+        req = urllib.request.Request(OLLAMA_URL + "/api/show",
+                                     data=json.dumps({"model": model}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            caps = json.load(r).get("capabilities") or []
+        return "vision" in caps
+    except Exception as e:
+        print("ollama show error", e, flush=True)
+        return False
+
+def read_image_b64(attachment):
+    """Read a received image attachment off disk and base64-encode it."""
+    path = os.path.join(ATTACH_DIR, attachment.get("id", ""))
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
 def chat_stream(model, messages, options):
     """Yield content deltas from Ollama's /api/chat as they stream in."""
@@ -191,10 +265,11 @@ def chat_stream(model, messages, options):
 
 # ----- help text -----------------------------------------------------------
 def models_block():
+    _, f2a = build_aliases()
     lines = []
     for m in list_models():
-        d = MODEL_DESC.get(m) or MODEL_DESC.get(m.replace(":latest", ""))
-        alias = _REV_ALIAS.get(m) or _REV_ALIAS.get(m.replace(":latest", ""))
+        d = MODEL_DESC.get(m) or MODEL_DESC.get(_norm(m))
+        alias = f2a.get(_norm(m))
         tag = f"[{alias}] " if alias else ""
         lines.append(f"• {tag}{m}" + (f"   {d}" if d else ""))
     return "\n".join(lines) if lines else "(no models found)"
@@ -247,7 +322,7 @@ def info_text(s):
 
 
 # ----- message handling ----------------------------------------------------
-def handle(sender, text, target_author, target_ts):
+def handle(sender, text, target_author, target_ts, attachments=None):
     key = canonical(sender)                       # phone number if known, else the id (uuid)
     is_owner = (key == OWNER or sender == OWNER)
     with user_lock(key):
@@ -349,7 +424,10 @@ def handle(sender, text, target_author, target_ts):
                     reply(f"{arg} not in allowlist."); return
             reply(f"Unknown command {cmd}. /help for the menu."); return
 
-        # ----- not a command: it's a prompt -----
+        # ----- not a command: it's a prompt (maybe with image attachments) -----
+        images = [a for a in (attachments or [])
+                  if str(a.get("contentType", "")).startswith("image/")]
+
         if not s["model"]:
             reply("⚠️ No model loaded. Pick one:\n" + models_block() +
                   "\n→ text a name or /open <name> to start.")
@@ -360,15 +438,31 @@ def handle(sender, text, target_author, target_ts):
                 send(ACCOUNT if is_owner else sender, f"🤖 {full} — open. /help for commands.")
             return
 
-        # generate — stream and flush paragraph-by-paragraph (on blank lines)
         target = ACCOUNT if is_owner else sender
+
+        # images only go to vision-capable models
+        image_b64 = []
+        if images:
+            if not model_is_vision(s["model"]):
+                reply(f"⚠️ {s['model']} is not an image model — it can't read images. "
+                      f"/open a vision model (a llava / *-vision model) first.")
+                return
+            try:
+                image_b64 = [read_image_b64(a) for a in images]
+            except Exception as e:
+                reply(f"⚠️ couldn't read the image: {e}"); return
+
+        # generate — stream and flush paragraph-by-paragraph (on blank lines)
         react(target, target_author, target_ts, "👀")
+        user_msg = {"role": "user", "content": body or "(image)"}
+        if image_b64:
+            user_msg["images"] = image_b64
         if s["raw"]:
-            messages = [{"role": "user", "content": body}]
+            messages = [user_msg]
         else:
             messages = [{"role": "system", "content": s["system"] or DEFAULT_SYSTEM}]
             messages += s["history"]
-            messages.append({"role": "user", "content": body})
+            messages.append(user_msg)
         full, buf, sent_any = "", "", False
         try:
             for delta in chat_stream(s["model"], messages, s["options"]):
@@ -388,7 +482,8 @@ def handle(sender, text, target_author, target_ts):
         if not sent_any:
             send(target, "(empty response)")
         if not s["raw"]:
-            s["history"].append({"role": "user", "content": body})
+            hist = (body + " [image]").strip() if (image_b64 and body) else ("[image]" if image_b64 else body)
+            s["history"].append({"role": "user", "content": hist})
             s["history"].append({"role": "assistant", "content": full.strip()})
             save_state(st)
         react(target, target_author, target_ts, "✅")
@@ -396,7 +491,7 @@ def handle(sender, text, target_author, target_ts):
 
 # ----- SSE listener --------------------------------------------------------
 def extract(envelope):
-    """Return (sender, text, target_author, target_ts) or None."""
+    """Return (sender, text, target_author, target_ts, attachments) or None."""
     env = envelope.get("envelope", envelope)
     ts = env.get("timestamp")
     # Note to Self: sync sentMessage to own account
@@ -405,15 +500,18 @@ def extract(envelope):
         sent = sync.get("sentMessage")
         if sent and isinstance(sent, dict):
             dest = sent.get("destinationNumber") or sent.get("destination")
-            if dest == ACCOUNT and sent.get("message"):
-                return OWNER, sent["message"], OWNER, sent.get("timestamp", ts)
+            atts = sent.get("attachments") or []
+            if dest == ACCOUNT and (sent.get("message") or atts):
+                return OWNER, sent.get("message") or "", OWNER, sent.get("timestamp", ts), atts
         return None
     # normal DM
     data = env.get("dataMessage")
-    if data and isinstance(data, dict) and data.get("message"):
-        sender = env.get("sourceNumber") or env.get("source")
-        if sender:
-            return sender, data["message"], sender, ts
+    if data and isinstance(data, dict):
+        atts = data.get("attachments") or []
+        if data.get("message") or atts:
+            sender = env.get("sourceNumber") or env.get("sourceUuid") or env.get("source")
+            if sender:
+                return sender, data.get("message") or "", sender, ts, atts
     return None
 
 def listen():
@@ -433,14 +531,15 @@ def listen():
                     got = extract(payload)
                     if not got:
                         continue
-                    sender, text, tauthor, tts = got
-                    print(f"recv from {sender}: {text[:60]!r}", flush=True)
+                    sender, text, tauthor, tts, atts = got
+                    print(f"recv from {sender}: {text[:60]!r}" +
+                          (f" (+{len(atts)} attachment)" if atts else ""), flush=True)
                     if tts in _seen:
                         continue
                     _seen.add(tts)
                     if len(_seen) > 2000:
                         _seen.clear()
-                    threading.Thread(target=handle, args=(sender, text, tauthor, tts),
+                    threading.Thread(target=handle, args=(sender, text, tauthor, tts, atts),
                                      daemon=True).start()
         except Exception as e:
             print("SSE error, reconnecting:", e, flush=True)

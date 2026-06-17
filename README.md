@@ -39,6 +39,8 @@ Then text **`/help`** to that number's **Note to Self**.
   saved to disk until `/reset`; the model isn't pinned in VRAM between turns.
 - **Every generation parameter** tunable via `/set` (temperature, top_p, num_ctx,
   seed, mirostat, …), plus a `/raw` mode and a configurable default system prompt.
+- **Images** — send a photo to a vision model (llava, *-vision, …) and it's
+  passed straight to the model; non-vision models reply that they can't read it.
 - **Streams paragraph-by-paragraph** — replies arrive as each paragraph finishes,
   not as one wall of text at the end; 👀 / ✅ reactions mark received vs. done.
 - **Owner-managed allowlist** — only you can `/allow` others; everyone else is
@@ -78,6 +80,7 @@ aliases (e.g. `L70A`, `GO120`, `DS70R`, `Q30C`) are shown by `/models`; edit the
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama base URL |
 | `SIGNAL_OLLAMA_STATE` | `~/signal-ollama/state.json` | Session/allowlist store |
 | `SIGNAL_OLLAMA_SYSTEM` | `You are a helpful, concise assistant.` | Default system prompt |
+| `SIGNAL_ATTACHMENTS_DIR` | `~/.local/share/signal-cli/attachments` | Where signal-cli saves received images (point at the daemon's config volume if dockerized) |
 
 > ⚠️ **signal-cli must be ≥ 0.14.5.** Earlier versions crash on every inbound
 > message (`getServerGuid … must not be null`) after a 2025 Signal server change.
