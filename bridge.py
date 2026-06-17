@@ -131,6 +131,29 @@ def react(recipient, target_author, target_ts, emoji, remove=False):
                          "targetTimestamp": target_ts, "remove": remove})
 
 
+# ----- identity resolution -------------------------------------------------
+_uuid2num = {}
+
+def _refresh_contacts():
+    r = rpc("listContacts", {"account": ACCOUNT})
+    res = (r or {}).get("result")
+    if isinstance(res, list):
+        _uuid2num.clear()
+        for c in res:
+            u, n = c.get("uuid"), c.get("number")
+            if u and n:
+                _uuid2num[u] = n
+
+def canonical(idstr):
+    """Map a sender id to a phone number when signal-cli knows it; otherwise
+    return the id unchanged (UUIDs are stable identifiers in their own right)."""
+    if not idstr or idstr.startswith("+"):
+        return idstr
+    if idstr not in _uuid2num:
+        _refresh_contacts()
+    return _uuid2num.get(idstr, idstr)
+
+
 # ----- ollama --------------------------------------------------------------
 def list_models():
     try:
@@ -207,8 +230,9 @@ def help_text(is_owner):
     if is_owner:
         t += ["", "Owner only:",
               "• /users                list allowed users",
-              "• /allow <+number> [label]   grant access",
-              "• /revoke <+number>     remove access"]
+              "• /pending              show unknown senders waiting (their id)",
+              "• /allow <+number|uuid> [label]   grant access",
+              "• /revoke <id>          remove access"]
     t += ["", "Models:", models_block()]
     return "\n".join(t)
 
@@ -224,18 +248,22 @@ def info_text(s):
 
 # ----- message handling ----------------------------------------------------
 def handle(sender, text, target_author, target_ts):
-    is_owner = (sender == OWNER)
-    with user_lock(sender):
+    key = canonical(sender)                       # phone number if known, else the id (uuid)
+    is_owner = (key == OWNER or sender == OWNER)
+    with user_lock(key):
         st = load_state()
-        # access control — owner + allowlisted users only; everyone else ignored
-        if not is_owner and sender not in st["allow"]:
+        # access control — owner + allowlisted (by number OR uuid); else ignored.
+        # Unknown senders are recorded for /pending, silently (no notification).
+        if not is_owner and sender not in st["allow"] and key not in st["allow"]:
+            st.setdefault("pending", {})[sender] = text[:60]
+            save_state(st)
             return
-        s = session(st, sender)
+        s = session(st, key)
         body = text.strip()
         low = body.lower()
 
         def reply(msg):
-            send(ACCOUNT if sender == OWNER else sender, msg)
+            send(ACCOUNT if is_owner else sender, msg)
 
         # ----- commands -----
         if body.startswith("/"):
@@ -294,19 +322,26 @@ def handle(sender, text, target_author, target_ts):
                     del s["options"][arg]; save_state(st); reply(f"✓ {arg} cleared."); return
                 reply(f"{arg} not set."); return
             # owner commands
-            if cmd in ("/users", "/allow", "/revoke"):
+            if cmd in ("/users", "/allow", "/revoke", "/pending"):
                 if not is_owner:
                     reply("Owner only."); return
                 if cmd == "/users":
                     lines = [f"• {OWNER}   you (owner)"] + [f"• {n}   {l}" for n, l in st["allow"].items()]
                     reply("Allowed:\n" + "\n".join(lines)); return
+                if cmd == "/pending":
+                    pend = st.get("pending", {})
+                    if not pend:
+                        reply("No pending senders."); return
+                    lines = [f"• {sid}\n    said: {msg!r}" for sid, msg in pend.items()]
+                    reply("Pending (use /allow <id> [label]):\n" + "\n".join(lines)); return
                 if cmd == "/allow":
                     sp = arg.split(maxsplit=1)
-                    num = sp[0] if sp else ""
-                    if not num.startswith("+"):
-                        reply("Usage: /allow +<number> [label]"); return
-                    st["allow"][num] = sp[1] if len(sp) > 1 else ""
-                    save_state(st); reply(f"✓ {num} {st['allow'][num]} can now text the bot."); return
+                    who = sp[0] if sp else ""
+                    if not who:
+                        reply("Usage: /allow <+number|uuid> [label]"); return
+                    st["allow"][who] = sp[1] if len(sp) > 1 else ""
+                    st.get("pending", {}).pop(who, None)
+                    save_state(st); reply(f"✓ {who} {st['allow'][who]} can now text the bot."); return
                 if cmd == "/revoke":
                     if arg in st["allow"]:
                         lbl = st["allow"].pop(arg); st["sessions"].pop(arg, None)
@@ -322,11 +357,11 @@ def handle(sender, text, target_author, target_ts):
             full = resolve_model(body)
             if full:
                 s["model"] = full; s["history"] = []; save_state(st)
-                send(ACCOUNT if sender == OWNER else sender, f"🤖 {full} — open. /help for commands.")
+                send(ACCOUNT if is_owner else sender, f"🤖 {full} — open. /help for commands.")
             return
 
         # generate — stream and flush paragraph-by-paragraph (on blank lines)
-        target = ACCOUNT if sender == OWNER else sender
+        target = ACCOUNT if is_owner else sender
         react(target, target_author, target_ts, "👀")
         if s["raw"]:
             messages = [{"role": "user", "content": body}]

@@ -57,8 +57,12 @@ Then text **`/help`** to that number's **Note to Self**.
 /raw                  toggle raw mode (no history, no system prompt)
 /set <param> <value>  set any Ollama option  ·  /unset  ·  /temp <v>  ·  /ctx <n>
 
-Owner only:  /users   ·   /allow <+number> [label]   ·   /revoke <+number>
+Owner only:  /users  ·  /pending  ·  /allow <+number|uuid> [label]  ·  /revoke <id>
 ```
+
+> Signal sometimes exposes a sender only by **UUID** (number privacy). `/pending`
+> lists unknown senders' IDs so you can `/allow` the right one; allow entries may
+> be a number or a UUID.
 
 Anything that isn't a command is sent to the model as a prompt. Short model
 aliases (e.g. `L70A`, `GO120`, `DS70R`, `Q30C`) are shown by `/models`; edit the
@@ -84,6 +88,8 @@ aliases (e.g. `L70A`, `GO120`, `DS70R`, `Q30C`) are shown by `/models`; edit the
   "texting the bot" means texting your number. For a separate identity, register a
   dedicated number for signal-cli.
 - **Trust:** anyone you `/allow` can run prompts on your hardware.
+- **Memory:** a model must fit in RAM/VRAM to load. (E.g. a 149 GB quant won't
+  run on a 128 GB box — Ollama will fail to load it.)
 
 ## License
 
