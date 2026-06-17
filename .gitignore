@@ -1,0 +1,16 @@
+# local state — contains your phone number, allowlist, and conversation history
+state.json
+*.state.json
+
+# linking artifacts
+link.png
+*.qr.png
+sgnl-*.txt
+
+# python
+__pycache__/
+*.pyc
+
+# editor / os
+.DS_Store
+*.swp
