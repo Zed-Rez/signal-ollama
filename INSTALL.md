@@ -133,7 +133,7 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/rpc -H 'Content-Type: application/j
 ## 4. The bridge
 
 ```bash
-git clone <your-fork-url> signal-ollama && cd signal-ollama
+git clone https://github.com/Zed-Rez/signal-ollama && cd signal-ollama
 export SIGNAL_ACCOUNT="+15551234567"     # the number you just linked
 export SIGNAL_OWNER="$SIGNAL_ACCOUNT"    # who can manage the allowlist
 ./install.sh                              # installs + enables the systemd --user service

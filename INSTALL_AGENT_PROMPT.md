@@ -45,8 +45,9 @@ Do the following, checking each step before moving on:
    -> + ). The URI expires in ~1 min, so regenerate if I'm slow. Restart the
    daemon. Confirm via listAccounts that my number is registered.
 
-4. INSTALL THE BRIDGE: clone the signal-ollama repo (or copy bridge.py +
-   install.sh into ~/signal-ollama), then:
+4. INSTALL THE BRIDGE:
+     git clone https://github.com/Zed-Rez/signal-ollama ~/signal-ollama
+     cd ~/signal-ollama
      export SIGNAL_ACCOUNT="<my number>"
      export SIGNAL_OWNER="$SIGNAL_ACCOUNT"
      ./install.sh
