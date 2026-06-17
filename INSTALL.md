@@ -1,19 +1,55 @@
 # Install guide — signal-ollama
 
-End-to-end setup: Ollama → signal-cli daemon → link a number → run the bridge.
-Commands assume Linux/macOS with Docker. Nothing here needs root except the
-Docker install itself.
+End-to-end setup on a fresh machine: base tools → Ollama → signal-cli daemon →
+link a number → run the bridge. Linux/macOS. The only steps needing root are
+installing the base packages (git/curl/python3/Docker) in step 0.
 
 ---
 
+## 0. Prerequisites (fresh machine)
+
+The bridge is pure Python stdlib, but the surrounding pieces need a few base
+tools: **git, curl, python3, and Docker**. Check what's there and install the rest.
+
+**Debian/Ubuntu:**
+```bash
+# detect what's missing
+for c in git curl python3 docker; do
+  command -v "$c" >/dev/null && echo "$c: ok" || echo "$c: MISSING"
+done
+
+# install whatever was missing
+sudo apt-get update
+sudo apt-get install -y git curl python3 docker.io
+
+# start Docker and allow running it without sudo
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"     # then log out/in, or run: newgrp docker
+```
+
+**macOS:** install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+and start it; `git`, `curl`, `python3` come with the Xcode CLT
+(`xcode-select --install`).
+
+Verify all four:
+```bash
+git --version && curl --version | head -1 && python3 --version && docker --version
+```
+
 ## 1. Ollama + a model
 
-Install Ollama (https://ollama.com/download), then verify and pull at least one
+Install Ollama if it's not already present, make sure its API is up, then pull a
 model:
 
 ```bash
-# is the Ollama API up?
-curl -s http://127.0.0.1:11434/api/tags | head -c 200 || echo "Ollama not running — start it: 'ollama serve'"
+# install if missing
+#   Linux:
+command -v ollama >/dev/null || curl -fsSL https://ollama.com/install.sh | sh
+#   macOS: download the app from https://ollama.com/download (or: brew install ollama)
+
+# is the API up? (the Linux installer starts a service; otherwise run `ollama serve &`)
+curl -s http://127.0.0.1:11434/api/tags >/dev/null \
+  && echo "Ollama up" || echo "Ollama not running — start it: 'ollama serve'"
 
 # pull a model (pick any; small one shown for a quick test)
 ollama pull qwen2.5-coder:3b
@@ -133,6 +169,8 @@ hello                   # chat
 |---------|-----|
 | Inbound messages silently dropped | signal-cli too old — upgrade to ≥ 0.14.5 |
 | `daemon: 000` from the health check | daemon not up / wrong port |
+| `docker: permission denied` | run `newgrp docker` (or log out/in) after `usermod -aG docker` |
+| `ollama: command not found` | not installed — see step 1 |
 | `SIGNAL_ACCOUNT is not set` on start | export it (and re-`install.sh`) |
 | No reply, no 👀 | check `journalctl --user -u signal-ollama -f` for `recv from …` |
 | Replies appear to come "from you" | expected on a personal number — use a dedicated number |

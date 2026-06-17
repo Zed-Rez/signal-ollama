@@ -15,9 +15,18 @@ MY LINKED SIGNAL NUMBER (E.164): <FILL IN, e.g. +15551234567>
 
 Do the following, checking each step before moving on:
 
+0. BASE TOOLS: Ensure git, curl, python3, and Docker are installed. Detect with
+   `command -v <tool>`; install whatever is missing (Debian/Ubuntu:
+   `sudo apt-get update && sudo apt-get install -y git curl python3 docker.io`,
+   then `sudo systemctl enable --now docker` and `sudo usermod -aG docker $USER`;
+   macOS: Docker Desktop + Xcode CLT). Verify each before continuing.
+
 1. OLLAMA: Verify Ollama is reachable at http://127.0.0.1:11434 (curl
-   /api/tags). If not, install/start it. Ensure at least one model is pulled
-   (`ollama list`); if none, pull `qwen2.5-coder:3b` as a default and tell me.
+   /api/tags). If the `ollama` binary is missing, install it
+   (Linux: `curl -fsSL https://ollama.com/install.sh | sh`; macOS: the app from
+   ollama.com/download) and start it (`ollama serve` if no service). Ensure at
+   least one model is pulled (`ollama list`); if none, pull `qwen2.5-coder:3b`
+   as a default and tell me.
 
 2. SIGNAL-CLI DAEMON: Ensure a signal-cli HTTP daemon, version >= 0.14.5, is
    running on http://127.0.0.1:8080 (GET /api/v1/check returns 200). The easy
