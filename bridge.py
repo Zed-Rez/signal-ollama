@@ -31,7 +31,6 @@ MODEL_DESC = {
     "qwen2.5-coder:3b":          "coder, small/fast",
     "llama2-uncensored:70b":     "uncensored, older",
     "dolphin-llama3:70b":        "uncensored, 8k ctx",
-    "llama3.1:405b-instruct-q2_K": "405B (slow, heavy)",
 }
 
 # Short aliases (case-insensitive): initials + param count + role letter.
@@ -44,7 +43,6 @@ ALIASES = {
     "Q30C":  "qwen3-coder:30b",              # Qwen 30B Coder
     "Q3C":   "qwen2.5-coder:3b",             # Qwen 3B Coder
     "DV24":  "devstral:24b",                 # Devstral 24B
-    "L405":  "llama3.1:405b-instruct-q2_K",  # Llama 405B
     "DLP70": "dolphin-llama3:70b",           # Dolphin Llama 70B
 }
 _REV_ALIAS = {v: k for k, v in ALIASES.items()}
