@@ -22,6 +22,8 @@ DEFAULT_SYSTEM = os.environ.get("SIGNAL_OLLAMA_SYSTEM", "You are a helpful, conc
 # where signal-cli writes received attachments (host side of the daemon's config volume)
 ATTACH_DIR = os.path.expanduser(os.environ.get("SIGNAL_ATTACHMENTS_DIR",
                                                "~/.local/share/signal-cli/attachments"))
+# how long (s) the active model user keeps the single-GPU lock before it frees
+ACTIVE_TTL = int(os.environ.get("SIGNAL_ACTIVE_TTL", "600"))
 
 # Known-model one-line descriptions (anything else shows with no blurb).
 MODEL_DESC = {
@@ -147,6 +149,17 @@ def user_lock(user):
         if user not in _user_locks:
             _user_locks[user] = threading.Lock()
         return _user_locks[user]
+
+def _prio(st, key):
+    """Priority rank: owner is always highest; others default to 0."""
+    if key == OWNER:
+        return 10 ** 9
+    return int(st.get("rank", {}).get(key, 0))
+
+def _label(st, key):
+    if key == OWNER:
+        return "owner"
+    return st.get("allow", {}).get(key) or (key[:8] + "…" if len(key) > 12 else key)
 
 
 # ----- signal RPC ----------------------------------------------------------
@@ -307,7 +320,11 @@ def help_text(is_owner):
               "• /users                list allowed users",
               "• /pending              show unknown senders waiting (their id)",
               "• /allow <+number|uuid> [label]   grant access",
-              "• /revoke <id>          remove access"]
+              "• /revoke <id>          remove access",
+              "• /rank <id> <n>        set priority (higher wins the model)",
+              "• /who                  who holds the model + your DM target",
+              "• /msg <id> <text>      message someone directly (no model)",
+              "• /dm <id>              relay mode: your texts go to them; /close to exit"]
     t += ["", "Models:", models_block()]
     return "\n".join(t)
 
@@ -325,8 +342,16 @@ def info_text(s):
 def handle(sender, text, target_author, target_ts, attachments=None):
     key = canonical(sender)                       # phone number if known, else the id (uuid)
     is_owner = (key == OWNER or sender == OWNER)
-    with user_lock(key):
+    with user_lock(key):                          # per-user lock (no global deadlock on a slow model)
         st = load_state()
+
+        # relay inbound: if this sender is the person the OWNER is DM-ing, forward
+        # their message to the owner (bypasses the model and the allowlist).
+        dm_target = st.get("sessions", {}).get(OWNER, {}).get("dm")
+        if not is_owner and dm_target and dm_target in (sender, key):
+            send(ACCOUNT, f"💬 {_label(st, key)}: {text}")
+            return
+
         # access control — owner + allowlisted (by number OR uuid); else ignored.
         # Unknown senders are recorded for /pending, silently (no notification).
         if not is_owner and sender not in st["allow"] and key not in st["allow"]:
@@ -360,7 +385,11 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                 s["model"] = full; s["history"] = []
                 save_state(st); reply(f"🤖 {full} — open. /help for commands."); return
             if cmd == "/close":
+                if is_owner and s.get("dm"):            # exit DM relay first
+                    tgt = s.pop("dm"); save_state(st); reply(f"💬 DM with {tgt} closed."); return
                 s["model"] = None; s["history"] = []
+                if (st.get("active") or {}).get("key") == key:
+                    st["active"] = {}                   # free the model lock
                 save_state(st); reply("Session closed. Text a model name to start again."); return
             if cmd == "/reset":
                 s["history"] = []; save_state(st); reply("✓ conversation cleared (model + system kept)."); return
@@ -422,7 +451,43 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                         lbl = st["allow"].pop(arg); st["sessions"].pop(arg, None)
                         save_state(st); reply(f"✓ {arg} {lbl} removed."); return
                     reply(f"{arg} not in allowlist."); return
+            # owner: messaging people directly (no model) + priority ranks
+            if cmd in ("/msg", "/dm", "/rank", "/who"):
+                if not is_owner:
+                    reply("Owner only."); return
+                if cmd == "/who":
+                    act = st.get("active") or {}
+                    holding = act.get("key") and (time.time() - act.get("ts", 0) < ACTIVE_TTL)
+                    who = f"{act.get('label')} (model)" if holding else "nobody"
+                    reply(f"active model user: {who}\nyour DM target: {s.get('dm') or '—'}"); return
+                if cmd == "/msg":
+                    sp = arg.split(maxsplit=1)
+                    if len(sp) < 2:
+                        reply("Usage: /msg <+number|uuid> <text>"); return
+                    send(sp[0], sp[1]); reply(f"✓ sent to {sp[0]}."); return
+                if cmd == "/dm":
+                    who = arg.split()[0] if arg else ""
+                    if not who:
+                        if s.get("dm"):
+                            t = s.pop("dm"); save_state(st); reply(f"💬 DM with {t} closed."); return
+                        reply("Usage: /dm <+number|uuid>  — then your texts go to them (not the model); /close to exit."); return
+                    s["dm"] = who; save_state(st)
+                    reply(f"💬 DM mode on: your messages now go to {who} (not the model). Their replies come back here. /close to exit."); return
+                if cmd == "/rank":
+                    sp = arg.split()
+                    if len(sp) != 2:
+                        reply("Usage: /rank <+number|uuid> <n>   (higher n = higher priority)"); return
+                    try:
+                        st.setdefault("rank", {})[sp[0]] = int(sp[1])
+                    except ValueError:
+                        reply("rank must be a whole number."); return
+                    save_state(st); reply(f"✓ {sp[0]} priority = {sp[1]}"); return
             reply(f"Unknown command {cmd}. /help for the menu."); return
+
+        # owner DM relay (outbound): plain text goes to the person, not the model
+        if is_owner and s.get("dm"):
+            send(s["dm"], body)
+            return
 
         # ----- not a command: it's a prompt (maybe with image attachments) -----
         images = [a for a in (attachments or [])
@@ -437,6 +502,20 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                 s["model"] = full; s["history"] = []; save_state(st)
                 send(ACCOUNT if is_owner else sender, f"🤖 {full} — open. /help for commands.")
             return
+
+        # single active model user — priority-ranked; previous holder notified on takeover
+        now = time.time()
+        act = st.get("active") or {}
+        held = act.get("key") and (now - act.get("ts", 0) < ACTIVE_TTL)
+        if held and act["key"] != key:
+            if _prio(st, key) >= _prio(st, act["key"]):
+                send(ACCOUNT if act["key"] == OWNER else act["key"],
+                     f"🔔 {_label(st, key)} took over the bot.")
+            else:
+                reply(f"⏳ {_label(st, act['key'])} is using the bot — you'll get it when they're free.")
+                return
+        st["active"] = {"key": key, "label": _label(st, key), "ts": now}
+        save_state(st)
 
         target = ACCOUNT if is_owner else sender
 
