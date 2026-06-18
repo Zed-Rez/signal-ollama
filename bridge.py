@@ -174,13 +174,24 @@ def rpc(method, params):
         print("rpc error", method, e, flush=True)
         return None
 
-def send(recipient, text):
-    rpc("send", {"account": ACCOUNT, "recipient": [recipient], "message": text})
+def send(recipient, text, attachments=None, group=None):
+    params = {"account": ACCOUNT, "message": text}
+    if group:
+        params["groupId"] = group
+    else:
+        params["recipient"] = [recipient]
+    if attachments:
+        params["attachments"] = attachments
+    rpc("send", params)
 
-def react(recipient, target_author, target_ts, emoji, remove=False):
-    rpc("sendReaction", {"account": ACCOUNT, "recipient": [recipient],
-                         "emoji": emoji, "targetAuthor": target_author,
-                         "targetTimestamp": target_ts, "remove": remove})
+def react(recipient, target_author, target_ts, emoji, remove=False, group=None):
+    params = {"account": ACCOUNT, "emoji": emoji, "targetAuthor": target_author,
+              "targetTimestamp": target_ts, "remove": remove}
+    if group:
+        params["groupId"] = group
+    else:
+        params["recipient"] = [recipient]
+    rpc("sendReaction", params)
 
 
 # ----- identity resolution -------------------------------------------------
@@ -235,18 +246,38 @@ def _param_billions(m):
 def model_exists(name):
     return resolve_model(name) is not None
 
-def model_is_vision(model):
-    """True if Ollama reports the model can take images (capabilities: vision)."""
+def model_caps(model):
+    """Ollama capabilities list for a model, e.g. ['completion','vision']."""
     try:
         req = urllib.request.Request(OLLAMA_URL + "/api/show",
                                      data=json.dumps({"model": model}).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as r:
-            caps = json.load(r).get("capabilities") or []
-        return "vision" in caps
+            return json.load(r).get("capabilities") or []
     except Exception as e:
         print("ollama show error", e, flush=True)
-        return False
+        return []
+
+def model_is_vision(model):
+    """True if the model can read images (image input)."""
+    return "vision" in model_caps(model)
+
+def model_is_imagegen(model):
+    """True if the model generates images (image output) and isn't a chat model."""
+    caps = model_caps(model)
+    return "image" in caps and "completion" not in caps
+
+def generate_image(model, prompt, options):
+    """Run a text->image model, return a list of base64 PNGs (raises on error)."""
+    body = json.dumps({"model": model, "prompt": prompt, "stream": False,
+                       "options": options}).encode()
+    req = urllib.request.Request(OLLAMA_URL + "/api/generate", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=1800) as r:
+        d = json.load(r)
+    if d.get("error"):
+        raise RuntimeError(d["error"])
+    return d.get("images") or []
 
 def read_image_b64(attachment):
     """Read a received image attachment off disk and base64-encode it."""
@@ -302,10 +333,14 @@ def help_text(is_owner):
         "• /help           this menu",
         "",
         "Prompting:",
+        "• /ask <prompt>   prompt the model (needed in group chats; optional in DMs)",
         "• /sys <text>     set system prompt",
         "• /sys            show system prompt",
         "• /sys clear      revert to default system prompt",
         "• /raw            toggle raw mode (no history, no system prompt)",
+        "",
+        "In group chats: only commands and /ask reach the bot (no plain chatter).",
+        "Images: send a photo to a vision model; image-gen models reply with a picture.",
         "",
         "Tuning (any value optional, /unset <param> to clear):",
         "• /set <param> <value>   e.g. /set temperature 0.8",
@@ -339,34 +374,51 @@ def info_text(s):
 
 
 # ----- message handling ----------------------------------------------------
-def handle(sender, text, target_author, target_ts, attachments=None):
+def handle(sender, text, target_author, target_ts, attachments=None, group=None):
     key = canonical(sender)                       # phone number if known, else the id (uuid)
     is_owner = (key == OWNER or sender == OWNER)
-    with user_lock(key):                          # per-user lock (no global deadlock on a slow model)
+    chat_key = ("g:" + group) if group else key   # session + lock scope (group or 1:1)
+    with user_lock(chat_key):                     # per-chat lock (no global deadlock on a slow model)
         st = load_state()
 
-        # relay inbound: if this sender is the person the OWNER is DM-ing, forward
-        # their message to the owner (bypasses the model and the allowlist).
+        def reply(msg, attachments=None):         # reply to wherever the message came from
+            send(None if group else (ACCOUNT if is_owner else sender), msg,
+                 attachments=attachments, group=group)
+        def ack(emoji):
+            react(None if group else (ACCOUNT if is_owner else sender),
+                  target_author, target_ts, emoji, group=group)
+        def notify(ck, msg):
+            if isinstance(ck, str) and ck.startswith("g:"):
+                send(None, msg, group=ck[2:])
+            else:
+                send(ACCOUNT if ck == OWNER else ck, msg)
+
+        # relay inbound (1:1 only): if this sender is the owner's DM target, forward to owner
         dm_target = st.get("sessions", {}).get(OWNER, {}).get("dm")
-        if not is_owner and dm_target and dm_target in (sender, key):
+        if not group and not is_owner and dm_target and dm_target in (sender, key):
             send(ACCOUNT, f"💬 {_label(st, key)}: {text}")
             return
 
-        # access control — owner + allowlisted (by number OR uuid); else ignored.
-        # Unknown senders are recorded for /pending, silently (no notification).
+        # access control — owner + allowlisted; else ignored (pending tracked in 1:1 only)
         if not is_owner and sender not in st["allow"] and key not in st["allow"]:
-            st.setdefault("pending", {})[sender] = text[:60]
-            save_state(st)
+            if not group:
+                st.setdefault("pending", {})[sender] = text[:60]; save_state(st)
             return
-        s = session(st, key)
+        s = session(st, chat_key)
         body = text.strip()
-        low = body.lower()
 
-        def reply(msg):
-            send(ACCOUNT if is_owner else sender, msg)
+        # /ask <prompt> prompts the model inside a group (also works in DMs)
+        ask = body.startswith("/") and body.lower().split(" ", 1)[0] == "/ask"
+        if ask:
+            body = body[4:].strip()
+            if not body:
+                reply("Usage: /ask <prompt>"); return
+        # in groups, ignore ordinary chatter — only commands and /ask reach the bot
+        if group and not ask and not body.startswith("/"):
+            return
 
         # ----- commands -----
-        if body.startswith("/"):
+        if body.startswith("/") and not ask:
             parts = body.split(maxsplit=1)
             cmd = parts[0].lower()
             arg = parts[1].strip() if len(parts) > 1 else ""
@@ -388,7 +440,7 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                 if is_owner and s.get("dm"):            # exit DM relay first
                     tgt = s.pop("dm"); save_state(st); reply(f"💬 DM with {tgt} closed."); return
                 s["model"] = None; s["history"] = []
-                if (st.get("active") or {}).get("key") == key:
+                if (st.get("active") or {}).get("key") == chat_key:
                     st["active"] = {}                   # free the model lock
                 save_state(st); reply("Session closed. Text a model name to start again."); return
             if cmd == "/reset":
@@ -484,8 +536,8 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                     save_state(st); reply(f"✓ {sp[0]} priority = {sp[1]}"); return
             reply(f"Unknown command {cmd}. /help for the menu."); return
 
-        # owner DM relay (outbound): plain text goes to the person, not the model
-        if is_owner and s.get("dm"):
+        # owner DM relay (outbound, 1:1 only): plain text goes to the person, not the model
+        if is_owner and not group and s.get("dm"):
             send(s["dm"], body)
             return
 
@@ -495,29 +547,40 @@ def handle(sender, text, target_author, target_ts, attachments=None):
 
         if not s["model"]:
             reply("⚠️ No model loaded. Pick one:\n" + models_block() +
-                  "\n→ text a name or /open <name> to start.")
-            # treat a bare valid model name/alias as an open
-            full = resolve_model(body)
+                  ("\n→ /open <name>, then /ask <prompt>." if group
+                   else "\n→ text a name or /open <name> to start."))
+            full = resolve_model(body)            # a bare model name/alias opens it
             if full:
                 s["model"] = full; s["history"] = []; save_state(st)
-                send(ACCOUNT if is_owner else sender, f"🤖 {full} — open. /help for commands.")
+                reply(f"🤖 {full} — open. /help for commands.")
             return
 
         # single active model user — priority-ranked; previous holder notified on takeover
         now = time.time()
+        my_prio = _prio(st, key)
         act = st.get("active") or {}
         held = act.get("key") and (now - act.get("ts", 0) < ACTIVE_TTL)
-        if held and act["key"] != key:
-            if _prio(st, key) >= _prio(st, act["key"]):
-                send(ACCOUNT if act["key"] == OWNER else act["key"],
-                     f"🔔 {_label(st, key)} took over the bot.")
+        if held and act["key"] != chat_key:
+            if my_prio >= act.get("prio", 0):
+                notify(act["key"], f"🔔 {_label(st, key)} took over the bot.")
             else:
-                reply(f"⏳ {_label(st, act['key'])} is using the bot — you'll get it when they're free.")
+                reply(f"⏳ {act.get('label')} is using the bot — you'll get it when they're free.")
                 return
-        st["active"] = {"key": key, "label": _label(st, key), "ts": now}
+        st["active"] = {"key": chat_key, "label": ("a group" if group else _label(st, key)),
+                        "prio": my_prio, "ts": now}
         save_state(st)
 
-        target = ACCOUNT if is_owner else sender
+        # image-generation models: produce an image and send it back
+        if model_is_imagegen(s["model"]):
+            ack("👀")
+            try:
+                imgs = generate_image(s["model"], body, s["options"])
+            except Exception as e:
+                ack("❌"); reply(f"⚠️ image generation failed: {e}"); return
+            if not imgs:
+                ack("❌"); reply("⚠️ no image produced."); return
+            reply("🖼️", attachments=[f"data:image/png;base64,{b}" for b in imgs])
+            ack("✅"); return
 
         # images only go to vision-capable models
         image_b64 = []
@@ -532,7 +595,7 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                 reply(f"⚠️ couldn't read the image: {e}"); return
 
         # generate — stream and flush paragraph-by-paragraph (on blank lines)
-        react(target, target_author, target_ts, "👀")
+        ack("👀")
         user_msg = {"role": "user", "content": body or "(image)"}
         if image_b64:
             user_msg["images"] = image_b64
@@ -551,46 +614,49 @@ def handle(sender, text, target_author, target_ts, attachments=None):
                     para, buf = buf.split("\n\n", 1)
                     para = para.strip()
                     if para:
-                        send(target, para); sent_any = True
+                        reply(para); sent_any = True
         except Exception as e:
-            react(target, target_author, target_ts, "❌")
-            send(target, f"⚠️ error: {e}")
-            return
+            ack("❌"); reply(f"⚠️ error: {e}"); return
         if buf.strip():                              # final partial paragraph
-            send(target, buf.strip()); sent_any = True
+            reply(buf.strip()); sent_any = True
         if not sent_any:
-            send(target, "(empty response)")
+            reply("(empty response)")
         if not s["raw"]:
             hist = (body + " [image]").strip() if (image_b64 and body) else ("[image]" if image_b64 else body)
             s["history"].append({"role": "user", "content": hist})
             s["history"].append({"role": "assistant", "content": full.strip()})
             save_state(st)
-        react(target, target_author, target_ts, "✅")
+        ack("✅")
 
 
 # ----- SSE listener --------------------------------------------------------
 def extract(envelope):
-    """Return (sender, text, target_author, target_ts, attachments) or None."""
+    """Return (sender, text, target_author, target_ts, attachments, group) or None.
+    group is a base64 groupId when the message came from a Signal group, else None."""
     env = envelope.get("envelope", envelope)
     ts = env.get("timestamp")
-    # Note to Self: sync sentMessage to own account
+    # Owner's own messages (Note to Self, or messages the owner sent to a group)
     sync = env.get("syncMessage")
     if sync and isinstance(sync, dict):
         sent = sync.get("sentMessage")
         if sent and isinstance(sent, dict):
             dest = sent.get("destinationNumber") or sent.get("destination")
             atts = sent.get("attachments") or []
+            group = (sent.get("groupInfo") or {}).get("groupId")
+            if group and (sent.get("message") or atts):
+                return OWNER, sent.get("message") or "", OWNER, sent.get("timestamp", ts), atts, group
             if dest == ACCOUNT and (sent.get("message") or atts):
-                return OWNER, sent.get("message") or "", OWNER, sent.get("timestamp", ts), atts
+                return OWNER, sent.get("message") or "", OWNER, sent.get("timestamp", ts), atts, None
         return None
-    # normal DM
+    # incoming DM or group message
     data = env.get("dataMessage")
     if data and isinstance(data, dict):
         atts = data.get("attachments") or []
+        group = (data.get("groupInfo") or {}).get("groupId")
         if data.get("message") or atts:
             sender = env.get("sourceNumber") or env.get("sourceUuid") or env.get("source")
             if sender:
-                return sender, data.get("message") or "", sender, ts, atts
+                return sender, data.get("message") or "", sender, ts, atts, group
     return None
 
 def listen():
@@ -610,15 +676,15 @@ def listen():
                     got = extract(payload)
                     if not got:
                         continue
-                    sender, text, tauthor, tts, atts = got
-                    print(f"recv from {sender}: {text[:60]!r}" +
+                    sender, text, tauthor, tts, atts, group = got
+                    print(f"recv from {sender}{' [group]' if group else ''}: {text[:60]!r}" +
                           (f" (+{len(atts)} attachment)" if atts else ""), flush=True)
                     if tts in _seen:
                         continue
                     _seen.add(tts)
                     if len(_seen) > 2000:
                         _seen.clear()
-                    threading.Thread(target=handle, args=(sender, text, tauthor, tts, atts),
+                    threading.Thread(target=handle, args=(sender, text, tauthor, tts, atts, group),
                                      daemon=True).start()
         except Exception as e:
             print("SSE error, reconnecting:", e, flush=True)

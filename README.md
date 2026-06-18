@@ -39,8 +39,14 @@ Then text **`/help`** to that number's **Note to Self**.
   saved to disk until `/reset`; the model isn't pinned in VRAM between turns.
 - **Every generation parameter** tunable via `/set` (temperature, top_p, num_ctx,
   seed, mirostat, …), plus a `/raw` mode and a configurable default system prompt.
-- **Images** — send a photo to a vision model (llava, *-vision, …) and it's
-  passed straight to the model; non-vision models reply that they can't read it.
+- **Group chats** — command the bot in a Signal group: only `/` commands and
+  `/ask <prompt>` are handled (plain chatter is ignored), replies go to the group,
+  each group is its own session, and owner commands work there too.
+- **Images** — send a photo to a vision model (llava, *-vision); image-generation
+  models (Ollama `image` capability) reply with a generated picture; non-vision
+  chat models say they can't read images.
+- **One at a time, priority-ranked** — a single user holds the model; a higher-
+  or equal-priority sender (`/rank`) takes over and the previous holder is notified.
 - **Streams paragraph-by-paragraph** — replies arrive as each paragraph finishes,
   not as one wall of text at the end; 👀 / ✅ reactions mark received vs. done.
 - **Owner-managed allowlist** — only you can `/allow` others; everyone else is
@@ -58,8 +64,10 @@ Then text **`/help`** to that number's **Note to Self**.
 /sys <text>           set system prompt   ·   /sys (show)   ·   /sys clear
 /raw                  toggle raw mode (no history, no system prompt)
 /set <param> <value>  set any Ollama option  ·  /unset  ·  /temp <v>  ·  /ctx <n>
+/ask <prompt>         prompt the model (required in group chats)
 
-Owner only:  /users  ·  /pending  ·  /allow <+number|uuid> [label]  ·  /revoke <id>
+Owner only:  /users · /pending · /allow <+number|uuid> [label] · /revoke <id>
+             /rank <id> <n> · /who · /msg <id> <text> · /dm <id>
 ```
 
 > Signal sometimes exposes a sender only by **UUID** (number privacy). `/pending`
