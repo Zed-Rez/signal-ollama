@@ -24,6 +24,8 @@ ATTACH_DIR = os.path.expanduser(os.environ.get("SIGNAL_ATTACHMENTS_DIR",
                                                "~/.local/share/signal-cli/attachments"))
 # how long (s) the active model user keeps the single-GPU lock before it frees
 ACTIVE_TTL = int(os.environ.get("SIGNAL_ACTIVE_TTL", "600"))
+# auto-clear a session's model after this much idle time, unless /keep is set
+MODEL_TTL = int(os.environ.get("SIGNAL_MODEL_TTL", "900"))   # 15 min
 
 # Known-model one-line descriptions (anything else shows with no blurb).
 MODEL_DESC = {
@@ -193,6 +195,16 @@ def react(recipient, target_author, target_ts, emoji, remove=False, group=None):
         params["recipient"] = [recipient]
     rpc("sendReaction", params)
 
+def deliver(chat_key, msg, attachments=None):
+    """Send to a chat by its session key: a group ('g:<id>'), the owner ('self'),
+    or a 1:1 user id."""
+    if isinstance(chat_key, str) and chat_key.startswith("g:"):
+        send(None, msg, attachments=attachments, group=chat_key[2:])
+    elif chat_key == OWNER:
+        send(ACCOUNT, msg, attachments=attachments)
+    else:
+        send(chat_key, msg, attachments=attachments)
+
 
 # ----- identity resolution -------------------------------------------------
 _uuid2num = {}
@@ -328,6 +340,7 @@ def help_text(is_owner):
         "• /open <model>   load/switch model (or just text a model name when idle)",
         "• /models         list models",
         "• /close          unload current model",
+        "• /keep           pin the model (don't auto-close it after idle)",
         "• /reset          forget the conversation (keep model + system)",
         "• /info           show current model, system, params, mode",
         "• /help           this menu",
@@ -370,7 +383,8 @@ def info_text(s):
             f"system: {s['system'] or DEFAULT_SYSTEM}\n"
             f"mode:   {'RAW (no history/system)' if s['raw'] else 'chat (multi-turn)'}\n"
             f"params: {opts}\n"
-            f"history: {len(s['history'])} msgs")
+            f"history: {len(s['history'])} msgs\n"
+            f"auto-close: {'pinned (/keep)' if s.get('keep') else str(MODEL_TTL // 60) + 'm idle'}")
 
 
 # ----- message handling ----------------------------------------------------
@@ -387,11 +401,7 @@ def handle(sender, text, target_author, target_ts, attachments=None, group=None)
         def ack(emoji):
             react(None if group else (ACCOUNT if is_owner else sender),
                   target_author, target_ts, emoji, group=group)
-        def notify(ck, msg):
-            if isinstance(ck, str) and ck.startswith("g:"):
-                send(None, msg, group=ck[2:])
-            else:
-                send(ACCOUNT if ck == OWNER else ck, msg)
+        notify = deliver                          # send to any chat by its session key
 
         # relay inbound (1:1 only): if this sender is the owner's DM target, forward to owner
         dm_target = st.get("sessions", {}).get(OWNER, {}).get("dm")
@@ -416,6 +426,9 @@ def handle(sender, text, target_author, target_ts, attachments=None, group=None)
         # in groups, ignore ordinary chatter — only commands and /ask reach the bot
         if group and not ask and not body.startswith("/"):
             return
+
+        s["last"] = time.time()                   # real interaction → reset the idle timer
+        save_state(st)
 
         # ----- commands -----
         if body.startswith("/") and not ask:
@@ -445,6 +458,11 @@ def handle(sender, text, target_author, target_ts, attachments=None, group=None)
                 save_state(st); reply("Session closed. Text a model name to start again."); return
             if cmd == "/reset":
                 s["history"] = []; save_state(st); reply("✓ conversation cleared (model + system kept)."); return
+            if cmd == "/keep":
+                s["keep"] = not s.get("keep", False); save_state(st)
+                reply("📌 model pinned — it won't auto-close."
+                      if s["keep"] else f"⏳ model will auto-close after {MODEL_TTL // 60}m idle.")
+                return
             if cmd == "/info":
                 reply(info_text(s)); return
             if cmd == "/raw":
@@ -659,6 +677,28 @@ def extract(envelope):
                 return sender, data.get("message") or "", sender, ts, atts, group
     return None
 
+def reaper():
+    """Auto-clear each session's model after MODEL_TTL idle, unless it's /keep-pinned."""
+    while True:
+        time.sleep(60)
+        try:
+            st = load_state()
+            now = time.time()
+            changed = False
+            for ck, s in list(st.get("sessions", {}).items()):
+                if s.get("model") and not s.get("keep") and now - s.get("last", 0) > MODEL_TTL:
+                    s["model"] = None
+                    s["history"] = []
+                    if (st.get("active") or {}).get("key") == ck:
+                        st["active"] = {}
+                    changed = True
+                    deliver(ck, f"💤 model auto-closed after {MODEL_TTL // 60}m idle. "
+                                f"/open to start again (or /keep next time to pin it).")
+            if changed:
+                save_state(st)
+        except Exception as e:
+            print("reaper error", e, flush=True)
+
 def listen():
     url = SIGNAL_URL + f"/api/v1/events?account={ACCOUNT.replace('+', '%2B')}"
     while True:
@@ -699,4 +739,5 @@ if __name__ == "__main__":
     if not os.path.exists(STATE_FILE):
         save_state({"allow": {}, "sessions": {}})
     print(f"signal-ollama bridge starting (account {ACCOUNT[:5]}…)", flush=True)
+    threading.Thread(target=reaper, daemon=True).start()
     listen()
